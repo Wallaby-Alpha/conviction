@@ -12,9 +12,6 @@ Responsibilities:
     - Current holder list + balances for a mint
     - Historical transfer history for a wallet (to reconstruct accumulation)
     - Local on-disk caching with TTL, to cut down on API usage
-
-Nothing here computes retention, classifies wallets, or filters
-infrastructure addresses -- that's calculations.py / filters.py.
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import requests
@@ -124,11 +121,8 @@ class HeliusClient:
             )
         self._session = requests.Session()
 
-    # -- low level -----------------------------------------------------
-
     def _rpc_call(self, method: str, params: dict) -> Any:
-        """Call a Helius RPC method (used for DAS endpoints like
-        getTokenAccounts, getAsset, etc.)."""
+        """Call a Helius RPC method (used for DAS and specialized transfer endpoints)."""
         url = f"{config.HELIUS_RPC_BASE}/?api-key={self.api_key}"
         body = {
             "jsonrpc": "2.0",
@@ -137,12 +131,6 @@ class HeliusClient:
             "params": params,
         }
         return self._post_with_retry(url, body)["result"]
-
-    def _enhanced_api_get(self, path: str, params: dict) -> Any:
-        """Call a Helius Enhanced/REST API endpoint (e.g. transfer history)."""
-        url = f"{config.HELIUS_API_BASE}{path}"
-        params = {**params, "api-key": self.api_key}
-        return self._get_with_retry(url, params)
 
     def _post_with_retry(self, url: str, body: dict) -> dict:
         last_error: Optional[Exception] = None
@@ -162,24 +150,7 @@ class HeliusClient:
             except (requests.RequestException, HeliusAPIError) as exc:
                 last_error = exc
                 self._sleep_backoff(attempt)
-        raise HeliusAPIError(f"Request to {url} failed after retries: {last_error}")
-
-    def _get_with_retry(self, url: str, params: dict) -> Any:
-        last_error: Optional[Exception] = None
-        for attempt in range(config.MAX_RETRIES):
-            try:
-                resp = self._session.get(
-                    url, params=params, timeout=config.REQUEST_TIMEOUT_SECONDS
-                )
-                if resp.status_code == 429:
-                    self._sleep_backoff(attempt)
-                    continue
-                resp.raise_for_status()
-                return resp.json()
-            except requests.RequestException as exc:
-                last_error = exc
-                self._sleep_backoff(attempt)
-        raise HeliusAPIError(f"Request to {url} failed after retries: {last_error}")
+        raise HeliusAPIError(f"Request failed after retries: {last_error}")
 
     @staticmethod
     def _sleep_backoff(attempt: int) -> None:
@@ -210,9 +181,7 @@ class HeliusClient:
         _write_cache(cache_key, meta.__dict__)
         return meta
 
-    def get_token_holders(
-        self, mint: str, use_cache: bool = True
-    ) -> list[TokenAccountHolder]:
+    def get_token_holders(self, mint: str, use_cache: bool = True) -> list[TokenAccountHolder]:
         """Return every token account holding this mint, fully paginated."""
         cache_key = f"holders_{mint}"
         if use_cache:
@@ -234,7 +203,7 @@ class HeliusClient:
 
             result = self._rpc_call("getTokenAccounts", params)
             accounts = result.get("token_accounts", [])
-            decimals = result.get("decimals")  # not always present; resolved below
+            decimals = result.get("decimals")
 
             for acct in accounts:
                 holders.append(
@@ -253,11 +222,8 @@ class HeliusClient:
         _write_cache(cache_key, [h.__dict__ for h in holders])
         return holders
 
-    def get_wallet_transfers(
-        self, wallet: str, mint: str, use_cache: bool = True
-    ) -> list[TransferEvent]:
-        """Full inbound+outbound transfer history for `wallet`, filtered to
-        the given mint, oldest first."""
+    def get_wallet_transfers(self, wallet: str, mint: str, use_cache: bool = True) -> list[TransferEvent]:
+        """Full transfer history for a wallet using high-performance getTransfersByAddress."""
         cache_key = f"transfers_{wallet}_{mint}"
         if use_cache:
             cached = _read_cache(cache_key)
@@ -265,21 +231,20 @@ class HeliusClient:
                 return [TransferEvent(**t) for t in cached]
 
         transfers: list[TransferEvent] = []
-        before_signature: Optional[str] = None
+        cursor: Optional[str] = None
 
         while True:
-            # FIXED: Flattened params structure for the GET request endpoint layout
+            # Using robust RPC transfer indexing endpoint layout
             params: dict[str, Any] = {
+                "address": wallet,
                 "mint": mint,
-                "limit": config.PAGE_SIZE,
+                "limit": 500,  # Stable page limit constraint for transfer queries
             }
-            if before_signature:
-                params["before"] = before_signature
+            if cursor:
+                params["cursor"] = cursor
 
-            page = self._enhanced_api_get(
-                f"/v0/addresses/{wallet}/transfers", params
-            )
-            items = page.get("transfers", page if isinstance(page, list) else [])
+            result = self._rpc_call("getTransfersByAddress", params)
+            items = result.get("transfers", [])
             if not items:
                 break
 
@@ -287,18 +252,16 @@ class HeliusClient:
                 transfers.append(
                     TransferEvent(
                         signature=t.get("signature", ""),
-                        timestamp=int(t.get("timestamp", 0)),
+                        timestamp=int(t.get("blockTime", 0)),
                         from_address=t.get("fromUserAccount"),
                         to_address=t.get("toUserAccount"),
-                        amount_raw=int(t.get("tokenAmount", 0)),
+                        amount_raw=int(t.get("amount", 0)),
                         decimals=int(t.get("decimals", 0)),
                     )
                 )
 
-            if len(items) < config.PAGE_SIZE:
-                break
-            before_signature = items[-1].get("signature")
-            if not before_signature:
+            cursor = result.get("cursor")
+            if not cursor or len(items) < 500:
                 break
 
         transfers.sort(key=lambda t: t.timestamp)
