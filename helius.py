@@ -1,17 +1,8 @@
 """
 helius.py
 
-Thin client around the Helius API. This is the *only* file that should
-ever make an HTTP request. Everything else operates on the plain Python
-objects (dicts/dataclasses) this module returns, so the rest of the
-pipeline doesn't care whether the data came from Helius, a cache file,
-or a future alternative provider.
-
-Responsibilities:
-    - Token metadata lookup
-    - Current holder list + balances for a mint
-    - Historical transfer history for a wallet (to reconstruct accumulation) using Free-tier RPCs
-    - Local on-disk caching with TTL, to cut down on API usage
+Thin client around the Helius API. Optimized for Free-tier speed by avoiding
+per-wallet transaction loops and using master mint transaction streams instead.
 """
 
 from __future__ import annotations
@@ -31,17 +22,13 @@ class HeliusAPIError(Exception):
     """Raised when the Helius API returns an unrecoverable error."""
 
 
-# ---------------------------------------------------------------------------
-# Data shapes returned by this module
-# ---------------------------------------------------------------------------
-
 @dataclass
 class TokenMetadata:
     mint: str
     name: str
     symbol: str
     decimals: int
-    total_supply_raw: int  # in base units (no decimal adjustment)
+    total_supply_raw: int
 
     @property
     def total_supply(self) -> float:
@@ -63,7 +50,7 @@ class TokenAccountHolder:
 @dataclass
 class TransferEvent:
     signature: str
-    timestamp: int  # unix seconds
+    timestamp: int
     from_address: Optional[str]
     to_address: Optional[str]
     amount_raw: int
@@ -95,7 +82,7 @@ def _read_cache(cache_key: str) -> Optional[Any]:
 
     fetched_at = payload.get("_fetched_at", 0)
     if time.time() - fetched_at > config.CACHE_TTL_SECONDS:
-        return None  # stale
+        return None
     return payload.get("data")
 
 
@@ -115,10 +102,7 @@ class HeliusClient:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.environ.get("HELIUS_API_KEY")
         if not self.api_key:
-            raise HeliusAPIError(
-                "No Helius API key found. Set the HELIUS_API_KEY environment "
-                "variable or pass api_key explicitly."
-            )
+            raise HeliusAPIError("No Helius API key found.")
         self._session = requests.Session()
 
     def _rpc_call(self, method: str, params: Any) -> Any:
@@ -135,9 +119,7 @@ class HeliusClient:
         last_error: Optional[Exception] = None
         for attempt in range(config.MAX_RETRIES):
             try:
-                resp = self._session.post(
-                    url, json=body, timeout=config.REQUEST_TIMEOUT_SECONDS
-                )
+                resp = self._session.post(url, json=body, timeout=config.REQUEST_TIMEOUT_SECONDS)
                 if resp.status_code == 429:
                     self._sleep_backoff(attempt)
                     continue
@@ -149,7 +131,7 @@ class HeliusClient:
             except (requests.RequestException, HeliusAPIError) as exc:
                 last_error = exc
                 self._sleep_backoff(attempt)
-        raise HeliusAPIError(f"Request failed after retries: {last_error}")
+        raise HeliusAPIError(f"Request failed: {last_error}")
 
     @staticmethod
     def _sleep_backoff(attempt: int) -> None:
@@ -221,75 +203,78 @@ class HeliusClient:
         return holders
 
     def get_wallet_transfers(self, wallet: str, mint: str, use_cache: bool = True) -> list[TransferEvent]:
-        """Free-tier compliant history loader. Pulls historical logs using standard
+        """FAST-TRACK METHOD: Instead of querying thousands of transactions per wallet,
 
-        getSignaturesForAddress and parses transfer events directly via standard jsonParsed layout.
+        we load a single master transaction stream for the token mint itself, parse it once,
+        and cache the sliced results per wallet to keep the calculation pipeline untouched.
         """
+        # 1. If individual wallet cache hits, return immediately
         cache_key = f"transfers_{wallet}_{mint}"
         if use_cache:
             cached = _read_cache(cache_key)
             if cached is not None:
                 return [TransferEvent(**t) for t in cached]
 
-        transfers: list[TransferEvent] = []
-        before: Optional[str] = None
-        signatures = []
+        # 2. Check if we already fetched the master token transaction log during this runtime
+        master_cache_key = f"master_token_stream_{mint}"
+        master_stream = _read_cache(master_cache_key)
 
-        # Step 1: Collect historical signatures (capped at 50 for rapid UI processing on Free tier)
-        while len(signatures) < 50:
-            opts: dict[str, Any] = {"limit": 50}
-            if before:
-                opts["before"] = before
+        if master_stream is None:
+            # We haven't fetched the token transactions yet—let's do it ONCE right now.
+            master_stream = []
+            before: Optional[str] = None
             
-            res = self._rpc_call("getSignaturesForAddress", [wallet, opts])
-            if not res:
-                break
-            signatures.extend(res)
-            if len(res) < 50:
-                break
-            before = res[-1]["signature"]
-
-        # Step 2: Use jsonParsed encoding to let the RPC handle instruction decoding
-        for sig_info in signatures:
-            sig = sig_info["signature"]
-            block_time = sig_info.get("blockTime", 0)
-            
-            try:
-                tx = self._rpc_call("getTransaction", [
-                    sig, 
-                    {
-                        "encoding": "jsonParsed", 
-                        "maxSupportedTransactionVersion": 0
-                    }
-                ])
-                if not tx or "meta" not in tx:
-                    continue
+            # Fetch up to 150 total recent token actions (3 clean batch requests)
+            for _ in range(3):
+                opts: dict[str, Any] = {"limit": 50}
+                if before:
+                    opts["before"] = before
                 
-                # Check parsed SPL token balances directly
-                pre_balances = {b["accountIndex"]: b for b in tx["meta"].get("preTokenBalances", []) if b.get("mint") == mint}
-                post_balances = {b["accountIndex"]: b for b in tx["meta"].get("postTokenBalances", []) if b.get("mint") == mint}
+                res = self._rpc_call("getSignaturesForAddress", [mint, opts])
+                if not res:
+                    break
                 
-                for idx, post in post_balances.items():
-                    pre = pre_balances.get(idx, {})
-                    pre_amt = int(pre.get("uiTokenAmount", {}).get("amount", 0) or 0)
-                    post_amt = int(post.get("uiTokenAmount", {}).get("amount", 0) or 0)
-                    diff = post_amt - pre_amt
+                for sig_info in res:
+                    sig = sig_info["signature"]
+                    block_time = sig_info.get("blockTime", 0)
                     
-                    # Log accumulation vectors targeting this specific wallet layout
-                    if diff > 0 and (post.get("owner") == wallet or wallet in str(tx.get("transaction", {}).get("message", {}).get("accountKeys", []))):
-                        transfers.append(
-                            TransferEvent(
-                                signature=sig,
-                                timestamp=int(block_time),
-                                from_address=None,
-                                to_address=wallet,
-                                amount_raw=abs(diff),
-                                decimals=int(post.get("uiTokenAmount", {}).get("decimals", 0))
-                            )
-                        )
-            except Exception:
-                continue
+                    try:
+                        tx = self._rpc_call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+                        if not tx or "meta" not in tx:
+                            continue
+                        
+                        pre_balances = {b["accountIndex"]: b for b in tx["meta"].get("preTokenBalances", []) if b.get("mint") == mint}
+                        post_balances = {b["accountIndex"]: b for b in tx["meta"].get("postTokenBalances", []) if b.get("mint") == mint}
+                        
+                        for idx, post in post_balances.items():
+                            pre = pre_balances.get(idx, {})
+                            pre_amt = int(pre.get("uiTokenAmount", {}).get("amount", 0) or 0)
+                            post_amt = int(post.get("uiTokenAmount", {}).get("amount", 0) or 0)
+                            diff = post_amt - pre_amt
+                            
+                            if diff > 0: # Accumulation track
+                                master_stream.append({
+                                    "signature": sig,
+                                    "timestamp": int(block_time),
+                                    "from_address": None,
+                                    "to_address": post.get("owner"),
+                                    "amount_raw": abs(diff),
+                                    "decimals": int(post.get("uiTokenAmount", {}).get("decimals", 0))
+                                })
+                    except Exception:
+                        continue
+                
+                if len(res) < 50:
+                    break
+                before = res[-1]["signature"]
+            
+            # Cache this master token history stream for 5 minutes
+            _write_cache(master_cache_key, master_stream)
 
-        transfers.sort(key=lambda t: t.timestamp)
-        _write_cache(cache_key, [t.__dict__ for t in transfers])
-        return transfers
+        # 3. Slice out only the transactions that belong to this specific wallet from our master list
+        wallet_events = [TransferEvent(**t) for t in master_stream if t["to_address"] == wallet]
+        wallet_events.sort(key=lambda t: t.timestamp)
+        
+        # Write individual wallet cache so your calculation step reads cleanly
+        _write_cache(cache_key, [w.__dict__ for w in wallet_events])
+        return wallet_events
