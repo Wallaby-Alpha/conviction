@@ -122,7 +122,6 @@ class HeliusClient:
         self._session = requests.Session()
 
     def _rpc_call(self, method: str, params: Any) -> Any:
-        """Call a Helius RPC method (used for DAS and standard Solana RPC endpoints)."""
         url = f"{config.HELIUS_RPC_BASE}/?api-key={self.api_key}"
         body = {
             "jsonrpc": "2.0",
@@ -182,7 +181,6 @@ class HeliusClient:
         return meta
 
     def get_token_holders(self, mint: str, use_cache: bool = True) -> list[TokenAccountHolder]:
-        """Return every token account holding this mint, fully paginated."""
         cache_key = f"holders_{mint}"
         if use_cache:
             cached = _read_cache(cache_key)
@@ -223,9 +221,9 @@ class HeliusClient:
         return holders
 
     def get_wallet_transfers(self, wallet: str, mint: str, use_cache: bool = True) -> list[TransferEvent]:
-        """Free-tier friendly history builder. Pulls transaction signatures for an address
+        """Free-tier compliant history loader. Pulls historical logs using standard
 
-        and parses internal SPL Token instructions directly via standard getTransaction.
+        getSignaturesForAddress and parses transfer events directly via standard jsonParsed layout.
         """
         cache_key = f"transfers_{wallet}_{mint}"
         if use_cache:
@@ -237,9 +235,9 @@ class HeliusClient:
         before: Optional[str] = None
         signatures = []
 
-        # Step 1: Fetch all recent transaction signatures for the wallet address
-        while True:
-            opts: dict[str, Any] = {"limit": 100}
+        # Step 1: Collect historical signatures (capped at 50 for rapid UI processing on Free tier)
+        while len(signatures) < 50:
+            opts: dict[str, Any] = {"limit": 50}
             if before:
                 opts["before"] = before
             
@@ -247,21 +245,27 @@ class HeliusClient:
             if not res:
                 break
             signatures.extend(res)
-            if len(res) < 100 or len(signatures) >= 200: # Practical safety cap for runtime performance
+            if len(res) < 50:
                 break
             before = res[-1]["signature"]
 
-        # Step 2: Batch evaluate signatures to extract token transfer logs for the specific mint
+        # Step 2: Use jsonParsed encoding to let the RPC handle instruction decoding
         for sig_info in signatures:
             sig = sig_info["signature"]
             block_time = sig_info.get("blockTime", 0)
             
             try:
-                tx = self._rpc_call("getTransaction", [sig, {"maxSupportedTransactionVersion": 0, "encoding": "jsonStructured"}])
+                tx = self._rpc_call("getTransaction", [
+                    sig, 
+                    {
+                        "encoding": "jsonParsed", 
+                        "maxSupportedTransactionVersion": 0
+                    }
+                ])
                 if not tx or "meta" not in tx:
                     continue
                 
-                # Check modern structured token balances to parse internal movements safely
+                # Check parsed SPL token balances directly
                 pre_balances = {b["accountIndex"]: b for b in tx["meta"].get("preTokenBalances", []) if b.get("mint") == mint}
                 post_balances = {b["accountIndex"]: b for b in tx["meta"].get("postTokenBalances", []) if b.get("mint") == mint}
                 
@@ -271,20 +275,20 @@ class HeliusClient:
                     post_amt = int(post.get("uiTokenAmount", {}).get("amount", 0) or 0)
                     diff = post_amt - pre_amt
                     
-                    if diff > 0: # Wallet accumulation tracking loop
-                        owner = post.get("owner") or wallet
+                    # Log accumulation vectors targeting this specific wallet layout
+                    if diff > 0 and (post.get("owner") == wallet or wallet in str(tx.get("transaction", {}).get("message", {}).get("accountKeys", []))):
                         transfers.append(
                             TransferEvent(
                                 signature=sig,
                                 timestamp=int(block_time),
                                 from_address=None,
-                                to_address=owner,
+                                to_address=wallet,
                                 amount_raw=abs(diff),
                                 decimals=int(post.get("uiTokenAmount", {}).get("decimals", 0))
                             )
                         )
             except Exception:
-                continue # Skip transient transaction layout parses safely
+                continue
 
         transfers.sort(key=lambda t: t.timestamp)
         _write_cache(cache_key, [t.__dict__ for t in transfers])
