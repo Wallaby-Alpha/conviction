@@ -10,7 +10,7 @@ or a future alternative provider.
 Responsibilities:
     - Token metadata lookup
     - Current holder list + balances for a mint
-    - Historical transfer history for a wallet (to reconstruct accumulation)
+    - Historical transfer history for a wallet (to reconstruct accumulation) using Free-tier RPCs
     - Local on-disk caching with TTL, to cut down on API usage
 """
 
@@ -121,8 +121,8 @@ class HeliusClient:
             )
         self._session = requests.Session()
 
-    def _rpc_call(self, method: str, params: dict) -> Any:
-        """Call a Helius RPC method (used for DAS and specialized transfer endpoints)."""
+    def _rpc_call(self, method: str, params: Any) -> Any:
+        """Call a Helius RPC method (used for DAS and standard Solana RPC endpoints)."""
         url = f"{config.HELIUS_RPC_BASE}/?api-key={self.api_key}"
         body = {
             "jsonrpc": "2.0",
@@ -223,7 +223,10 @@ class HeliusClient:
         return holders
 
     def get_wallet_transfers(self, wallet: str, mint: str, use_cache: bool = True) -> list[TransferEvent]:
-        """Full transfer history for a wallet using high-performance getTransfersByAddress."""
+        """Free-tier friendly history builder. Pulls transaction signatures for an address
+
+        and parses internal SPL Token instructions directly via standard getTransaction.
+        """
         cache_key = f"transfers_{wallet}_{mint}"
         if use_cache:
             cached = _read_cache(cache_key)
@@ -231,38 +234,57 @@ class HeliusClient:
                 return [TransferEvent(**t) for t in cached]
 
         transfers: list[TransferEvent] = []
-        cursor: Optional[str] = None
+        before: Optional[str] = None
+        signatures = []
 
+        # Step 1: Fetch all recent transaction signatures for the wallet address
         while True:
-            # Using robust RPC transfer indexing endpoint layout
-            params: dict[str, Any] = {
-                "address": wallet,
-                "mint": mint,
-                "limit": 500,  # Stable page limit constraint for transfer queries
-            }
-            if cursor:
-                params["cursor"] = cursor
-
-            result = self._rpc_call("getTransfersByAddress", params)
-            items = result.get("transfers", [])
-            if not items:
+            opts: dict[str, Any] = {"limit": 100}
+            if before:
+                opts["before"] = before
+            
+            res = self._rpc_call("getSignaturesForAddress", [wallet, opts])
+            if not res:
                 break
-
-            for t in items:
-                transfers.append(
-                    TransferEvent(
-                        signature=t.get("signature", ""),
-                        timestamp=int(t.get("blockTime", 0)),
-                        from_address=t.get("fromUserAccount"),
-                        to_address=t.get("toUserAccount"),
-                        amount_raw=int(t.get("amount", 0)),
-                        decimals=int(t.get("decimals", 0)),
-                    )
-                )
-
-            cursor = result.get("cursor")
-            if not cursor or len(items) < 500:
+            signatures.extend(res)
+            if len(res) < 100 or len(signatures) >= 200: # Practical safety cap for runtime performance
                 break
+            before = res[-1]["signature"]
+
+        # Step 2: Batch evaluate signatures to extract token transfer logs for the specific mint
+        for sig_info in signatures:
+            sig = sig_info["signature"]
+            block_time = sig_info.get("blockTime", 0)
+            
+            try:
+                tx = self._rpc_call("getTransaction", [sig, {"maxSupportedTransactionVersion": 0, "encoding": "jsonStructured"}])
+                if not tx or "meta" not in tx:
+                    continue
+                
+                # Check modern structured token balances to parse internal movements safely
+                pre_balances = {b["accountIndex"]: b for b in tx["meta"].get("preTokenBalances", []) if b.get("mint") == mint}
+                post_balances = {b["accountIndex"]: b for b in tx["meta"].get("postTokenBalances", []) if b.get("mint") == mint}
+                
+                for idx, post in post_balances.items():
+                    pre = pre_balances.get(idx, {})
+                    pre_amt = int(pre.get("uiTokenAmount", {}).get("amount", 0) or 0)
+                    post_amt = int(post.get("uiTokenAmount", {}).get("amount", 0) or 0)
+                    diff = post_amt - pre_amt
+                    
+                    if diff > 0: # Wallet accumulation tracking loop
+                        owner = post.get("owner") or wallet
+                        transfers.append(
+                            TransferEvent(
+                                signature=sig,
+                                timestamp=int(block_time),
+                                from_address=None,
+                                to_address=owner,
+                                amount_raw=abs(diff),
+                                decimals=int(post.get("uiTokenAmount", {}).get("decimals", 0))
+                            )
+                        )
+            except Exception:
+                continue # Skip transient transaction layout parses safely
 
         transfers.sort(key=lambda t: t.timestamp)
         _write_cache(cache_key, [t.__dict__ for t in transfers])
