@@ -21,12 +21,20 @@ if not helius_key:
 
 # 3. Sidebar Configuration / Controls
 st.sidebar.header("Analysis Settings")
-min_pct = st.sidebar.slider(
+
+# 1. Let the user choose a clear percentage (e.g., 0.1% instead of 0.001)
+min_pct_input = st.sidebar.slider(
     "Min Holder % of Supply", 
-    min_value=0.0001, max_value=0.01, 
-    value=config.MIN_HOLDER_PCT_OF_SUPPLY, 
-    step=0.0001, format="%.4f"
+    min_value=0.01,    # 0.01% min
+    max_value=1.00,    # 1.0% max
+    value=config.MIN_HOLDER_PCT_OF_SUPPLY * 100, # Convert 0.001 to 0.1% for display
+    step=0.01, 
+    format="%.2f%%"    # Displays nicely as "0.10%"
 )
+
+# 2. Convert it back to a raw decimal fraction before passing it to your code
+min_pct = min_pct_input / 100
+
 max_wallets = st.sidebar.number_input("Max Wallets to Analyze", value=config.MAX_WALLETS_TO_ANALYZE)
 use_cache = st.sidebar.checkbox("Use Local Cache", value=True)
 
