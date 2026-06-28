@@ -268,15 +268,13 @@ class HeliusClient:
         before_signature: Optional[str] = None
 
         while True:
-            params: dict[str, Any] = {
-                "query": {
-                    "accounts": [wallet],
-                    "mint": mint,
-                },
-                "limit": config.PAGE_SIZE,
-            }
-            if before_signature:
-                params["before"] = before_signature
+    # Flatten the parameters directly into the main dictionary
+    params: dict[str, Any] = {
+        "mint": mint,
+        "limit": config.PAGE_SIZE,
+    }
+    if before_signature:
+        params["before"] = before_signature
 
             page = self._enhanced_api_get(
                 f"/v0/addresses/{wallet}/transfers", params
